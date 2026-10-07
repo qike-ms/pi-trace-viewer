@@ -2,6 +2,11 @@ import * as R from "./render-helpers.js";
 (() => {
   "use strict";
 
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  if (fragment.get("access")) sessionStorage.setItem("pi-trace-access", fragment.get("access"));
+  if (location.hash) history.replaceState(null, "", `${location.pathname}${location.search}`);
+  const accessToken = sessionStorage.getItem("pi-trace-access") || "";
+
   const state = {
     mode: "session",
     sessions: [],
@@ -62,7 +67,7 @@ import * as R from "./render-helpers.js";
       state.mode === "session" ? renderSessionTree() : renderCallTree();
     });
     document.querySelector("#refresh-btn").addEventListener("click", async () => {
-      await fetch("/api/refresh", { method: "POST" });
+      await fetch("/api/refresh", { method: "POST", headers: apiHeaders() });
       await refreshAll();
       toast("Data refreshed");
     });
@@ -98,7 +103,7 @@ import * as R from "./render-helpers.js";
   }
 
   function connectEvents() {
-    const source = new EventSource("/api/events");
+    const source = new EventSource(authenticatedUrl("/api/events"));
     source.addEventListener("ready", () => setLive("live", "live"));
     source.onopen = () => setLive("live", "live");
     source.onerror = () => setLive("offline", "reconnecting");
@@ -243,7 +248,7 @@ import * as R from "./render-helpers.js";
       <div class="session-title-row">
         <h1 class="session-title">${escapeHtml(session.name || "Session Export")}</h1>
         <span class="session-badge ${session.active ? "active" : ""}">${session.active ? "LIVE" : "HISTORICAL"}</span>
-        <div class="header-actions"><a class="small-btn" href="/api/sessions/${encodeURIComponent(session.id)}/download">↓ JSONL</a></div>
+        <div class="header-actions"><a class="small-btn" href="${escapeAttr(authenticatedUrl(`/api/sessions/${encodeURIComponent(session.id)}/download`))}">↓ JSONL</a></div>
       </div>
       <div class="info-grid">
         <div><span class="info-label">Session:</span><span class="info-value">${escapeHtml(session.id)}</span></div>
@@ -513,8 +518,16 @@ import * as R from "./render-helpers.js";
     if (value.status === "persisted") return value.filePath || "persisted";
     return value.error ? `memory only · ${value.error}` : "memory only";
   }
+  function apiHeaders() {
+    return { "X-Pi-Trace-Token": accessToken };
+  }
+  function authenticatedUrl(path) {
+    const url = new URL(path, location.origin);
+    url.searchParams.set("access_token", accessToken);
+    return `${url.pathname}${url.search}`;
+  }
   async function fetchJson(url) {
-    const response = await fetch(url, { cache: "no-store" });
+    const response = await fetch(url, { cache: "no-store", headers: apiHeaders() });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     return response.json();
   }

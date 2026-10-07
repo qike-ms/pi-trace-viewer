@@ -5,13 +5,17 @@ describe("redaction", () => {
 	it("redacts credential-shaped keys without removing observable content", () => {
 		const input = {
 			api_key: "secret",
+			"x-goog-api-key": "secret-2",
+			anthropicApiKey: "secret-3",
 			content: "keep this prompt",
-			nested: { accessToken: "secret-2", model: "gpt" },
+			nested: { accessToken: "secret-4", signingCredential: "secret-5", model: "gpt" },
 		};
 		expect(redactSensitive(input)).toEqual({
 			api_key: "[REDACTED]",
+			"x-goog-api-key": "[REDACTED]",
+			anthropicApiKey: "[REDACTED]",
 			content: "keep this prompt",
-			nested: { accessToken: "[REDACTED]", model: "gpt" },
+			nested: { accessToken: "[REDACTED]", signingCredential: "[REDACTED]", model: "gpt" },
 		});
 	});
 

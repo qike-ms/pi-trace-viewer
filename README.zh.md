@@ -8,10 +8,12 @@ Pi Trace Viewer 解决一个很具体的问题：**模型到底看到了什么�
 
 它作为 Pi 扩展运行，并启动一个本地浏览器 UI。你可以在不修改 Pi 原生 session 文件的情况下，实时查看会话树、模型调用、工具活动、压缩输入，以及 provider 实际收到的 payload。
 
+此加固分支增加了本地访问认证、严格的 Host/Origin 校验、默认仅内存存储、有大小限制的显式持久化、安全的符号链接处理和更强的凭据字段脱敏。它基于 [ZKiteLM/pi-trace-viewer](https://github.com/ZKiteLM/pi-trace-viewer)。
+
 ## 安装
 
 ```bash
-pi install npm:pi-trace-viewer
+pi install git:github.com/qike-ms/pi-trace-viewer@v0.1.0-hardened.1
 ```
 
 启动新的 Pi 会话后，打开 viewer：
@@ -20,18 +22,24 @@ pi install npm:pi-trace-viewer
 /trace-view
 ```
 
-Viewer 默认从 `http://127.0.0.1:7890` 启动。如果端口被占用，会自动递增寻找下一个可用端口，例如 `7891` 或 `7892`。
+Viewer 默认从 `http://127.0.0.1:7890` 启动。如果端口被占用，会自动递增寻找下一个可用端口，例如 `7891` 或 `7892`。Pi 会显示当前进程专用的访问 URL；随机 token 保留在 URL fragment 中，随后转入当前标签页的 `sessionStorage`，用于认证 API 请求。不要分享该 URL。
 
 如果只想在单次 Pi 运行中临时启用，不修改设置：
 
 ```bash
-pi -e npm:pi-trace-viewer
+pi -e git:github.com/qike-ms/pi-trace-viewer@v0.1.0-hardened.1
 ```
 
 如需指定自定义起始端口：
 
 ```bash
 pi --pi-trace-port 8890
+```
+
+Trace 默认只保存在内存中。如确实需要私有旁车文件，请显式启用：
+
+```bash
+pi --pi-trace-persist
 ```
 
 ## 可以查看什么
@@ -93,7 +101,7 @@ flowchart LR
     A[Pi session] --> B[Pi extension hooks]
     B --> C[In-memory viewer state]
     C --> D[localhost browser UI]
-    B --> E[.pi-traces/session-id.jsonl]
+    B -. 可选持久化 .-> E[.pi-traces/session-id.jsonl]
     D --> F[Session and LLM Calls]
 ```
 
@@ -110,7 +118,7 @@ flowchart LR
 
 ## 数据与隐私
 
-Pi Trace Viewer 只绑定 `127.0.0.1`。
+Pi Trace Viewer 只绑定 `127.0.0.1`。所有路由都需要随机的进程级访问 cookie，并拒绝 Host 或 Origin 不符合预期的请求。
 
 它不会写入 Pi 原生 session JSONL，也不会调用 `appendCustomEntry` 或 `appendCustomMessageEntry`。Pi 原生 session 仍然位于：
 
@@ -118,13 +126,13 @@ Pi Trace Viewer 只绑定 `127.0.0.1`。
 ~/.pi/agent/sessions/<encoded-cwd>/<session-id>.jsonl
 ```
 
-扩展会把旁车 trace 写入：
+持久化默认关闭。使用 `--pi-trace-persist` 后，扩展会把旁车 trace 写入：
 
 ```text
 <session-cwd>/.pi-traces/<session-id>.jsonl
 ```
 
-Trace 目录使用 `0700` 权限，trace 文件使用 `0600` 权限。credential-shaped 字段和敏感响应头会被脱敏，但 prompt、system instruction、工具结果和模型输出仍可能包含敏感信息。请把 `.pi-traces` 当作私有的本地调试数据。
+Trace 目录使用 `0700` 权限，trace 文件使用 `0600` 权限；符号链接存储会被拒绝，嵌套 `.gitignore` 防止误提交，每个 trace 上限为 64 MiB。credential-shaped 字段和敏感响应头会被脱敏，但 prompt、system instruction、工具结果和模型输出仍可能包含敏感信息。请把 `.pi-traces` 当作私有的本地调试数据。
 
 清理旧 trace：
 
@@ -135,7 +143,7 @@ rm -rf "/path/to/session-cwd/.pi-traces"
 ## 本地开发
 
 ```bash
-npm install
+npm ci --ignore-scripts
 npm run check
 pi -e /path/to/pi-trace-viewer
 ```

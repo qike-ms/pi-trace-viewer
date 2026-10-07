@@ -1,7 +1,28 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+	chmodSync,
+	closeSync,
+	constants,
+	existsSync,
+	fchmodSync,
+	fstatSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	writeSync,
+} from "node:fs";
+import { join } from "node:path";
 import type { CallView, SessionSnapshot, TracePersistence, TraceRecord } from "./types.ts";
 import { TRACE_SCHEMA_VERSION } from "./types.ts";
+
+export interface TraceStoreOptions {
+	persist?: boolean;
+	maxBytes?: number;
+}
+
+const DEFAULT_MAX_TRACE_BYTES = 64 * 1024 * 1024;
+const TRACE_IGNORE = "*\n!.gitignore\n";
 
 export type TraceListener = (record: TraceRecord) => void;
 type TraceRecordInput = TraceRecord extends infer RecordType
@@ -17,14 +38,30 @@ export class TraceStore {
 	private sequence = 0;
 	private listeners = new Set<TraceListener>();
 	private persistence: TracePersistence;
+	private maxBytes: number;
 
-	constructor(snapshot: SessionSnapshot) {
+	constructor(snapshot: SessionSnapshot, options: TraceStoreOptions = {}) {
 		this.sessionId = snapshot.id;
-		const filePath = join(snapshot.cwd, ".pi-traces", `${snapshot.id}.jsonl`);
-		const error = validateTraceDirectory(snapshot.cwd);
-		this.filePath = error ? undefined : filePath;
-		this.persistence = error ? { status: "memory_only", error } : { status: "persisted", filePath };
-		this.load();
+		this.maxBytes = options.maxBytes ?? DEFAULT_MAX_TRACE_BYTES;
+		if (options.persist) {
+			const prepared = prepareTraceFile(snapshot.cwd, snapshot.id, this.maxBytes);
+			this.filePath = prepared.filePath;
+			this.persistence = prepared.filePath
+				? { status: "persisted", filePath: prepared.filePath }
+				: { status: "memory_only", error: prepared.error };
+		} else {
+			this.filePath = undefined;
+			this.persistence = { status: "memory_only", error: "Persistence is disabled by default" };
+		}
+		try {
+			this.load();
+		} catch (error) {
+			this.persistence = {
+				status: "memory_only",
+				error: error instanceof Error ? error.message : String(error),
+			};
+			this.filePath = undefined;
+		}
 		if (!this.records.some((record) => record.type === "trace_header")) {
 			this.append({ type: "trace_header", sessionFile: snapshot.file, cwd: snapshot.cwd });
 		}
@@ -47,9 +84,7 @@ export class TraceStore {
 		this.records.push(complete);
 		if (this.filePath) {
 			try {
-				mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
-				appendFileSync(this.filePath, `${JSON.stringify(complete)}\n`, { encoding: "utf8", mode: 0o600 });
-				chmodSync(this.filePath, 0o600);
+				this.appendToFile(`${JSON.stringify(complete)}\n`);
 			} catch (error) {
 				this.persistence = {
 					status: "memory_only",
@@ -60,6 +95,26 @@ export class TraceStore {
 		}
 		for (const listener of this.listeners) listener(complete);
 		return complete;
+	}
+
+	private appendToFile(content: string): void {
+		if (!this.filePath) return;
+		const fd = openSync(
+			this.filePath,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW,
+			0o600,
+		);
+		try {
+			const stat = fstatSync(fd);
+			if (!stat.isFile()) throw new Error("Trace path is not a regular file");
+			if (stat.size + Buffer.byteLength(content) > this.maxBytes) {
+				throw new Error(`Trace reached the ${this.maxBytes}-byte persistence limit`);
+			}
+			writeSync(fd, content, undefined, "utf8");
+			fchmodSync(fd, 0o600);
+		} finally {
+			closeSync(fd);
+		}
 	}
 
 	getPersistence(): TracePersistence {
@@ -143,18 +198,26 @@ export class TraceStore {
 
 	private load(): void {
 		if (!this.filePath || !existsSync(this.filePath)) return;
-		const loaded: TraceRecord[] = [];
-		for (const line of readFileSync(this.filePath, "utf8").split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const record = JSON.parse(line) as TraceRecord;
-				if (record.schemaVersion === TRACE_SCHEMA_VERSION && record.sessionId === this.sessionId) loaded.push(record);
-			} catch {
-				// A truncated final line is expected after an abrupt process exit.
+		const fd = openSync(this.filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const stat = fstatSync(fd);
+			if (!stat.isFile()) throw new Error("Trace path is not a regular file");
+			if (stat.size > this.maxBytes) throw new Error(`Trace exceeds the ${this.maxBytes}-byte persistence limit`);
+			const loaded: TraceRecord[] = [];
+			for (const line of readFileSync(fd, "utf8").split("\n")) {
+				if (!line.trim()) continue;
+				try {
+					const record = JSON.parse(line) as TraceRecord;
+					if (record.schemaVersion === TRACE_SCHEMA_VERSION && record.sessionId === this.sessionId) loaded.push(record);
+				} catch {
+					// A truncated final line is expected after an abrupt process exit.
+				}
 			}
+			this.records = loaded;
+			this.sequence = loaded.reduce((max, record) => Math.max(max, record.sequence), 0);
+		} finally {
+			closeSync(fd);
 		}
-		this.records = loaded;
-		this.sequence = loaded.reduce((max, record) => Math.max(max, record.sequence), 0);
 	}
 
 	private reconcileHistoricalCompactions(snapshot: SessionSnapshot): void {
@@ -189,12 +252,56 @@ export class TraceStore {
 	}
 }
 
-function validateTraceDirectory(cwd: string): string | undefined {
+function prepareTraceFile(cwd: string, sessionId: string, maxBytes: number): { filePath?: string; error?: string } {
 	try {
-		const stat = statSync(cwd);
-		if (!stat.isDirectory()) return `Trace cwd is not a directory: ${cwd}`;
+		if (!/^[A-Za-z0-9._-]+$/.test(sessionId)) throw new Error("Session ID is not safe for trace persistence");
+		if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error("Trace persistence limit must be positive");
+		const resolvedCwd = realpathSync(cwd);
+		const cwdStat = lstatSync(resolvedCwd);
+		if (!cwdStat.isDirectory()) throw new Error(`Trace cwd is not a directory: ${cwd}`);
+
+		const traceDirectory = join(resolvedCwd, ".pi-traces");
+		if (existsSync(traceDirectory)) {
+			const stat = lstatSync(traceDirectory);
+			if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Trace directory must be a real directory");
+			assertOwner(stat.uid);
+		} else {
+			mkdirSync(traceDirectory, { mode: 0o700 });
+		}
+		chmodSync(traceDirectory, 0o700);
+		writePrivateFile(join(traceDirectory, ".gitignore"), TRACE_IGNORE);
+
+		const filePath = join(traceDirectory, `${sessionId}.jsonl`);
+		if (existsSync(filePath)) {
+			const stat = lstatSync(filePath);
+			if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Trace path must be a regular file");
+			assertOwner(stat.uid);
+			if (stat.size > maxBytes) throw new Error(`Trace exceeds the ${maxBytes}-byte persistence limit`);
+			chmodSync(filePath, 0o600);
+		}
+		return { filePath };
 	} catch (error) {
-		return error instanceof Error ? error.message : String(error);
+		return { error: error instanceof Error ? error.message : String(error) };
 	}
-	return undefined;
+}
+
+function writePrivateFile(path: string, content: string): void {
+	const fd = openSync(
+		path,
+		constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+		0o600,
+	);
+	try {
+		if (!fstatSync(fd).isFile()) throw new Error("Trace metadata path is not a regular file");
+		writeSync(fd, content, undefined, "utf8");
+		fchmodSync(fd, 0o600);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function assertOwner(uid: number): void {
+	if (typeof process.getuid === "function" && uid !== process.getuid()) {
+		throw new Error("Trace storage is not owned by the current user");
+	}
 }

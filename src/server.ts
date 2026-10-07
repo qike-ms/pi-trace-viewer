@@ -1,15 +1,19 @@
-import { createServer, type Server, type ServerResponse } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import type { SessionRegistration, SessionSnapshot, TraceRecord } from "./types.ts";
-import { TraceStore } from "./store.ts";
+import { TraceStore, type TraceStoreOptions } from "./store.ts";
 
 const require = createRequire(import.meta.url);
 const webRoot = fileURLToPath(new URL("../web", import.meta.url));
 const markedPath = join(dirname(require.resolve("marked")), "marked.umd.js");
 const highlightPath = require.resolve("@highlightjs/cdn-assets/highlight.min.js");
+const ACCESS_HEADER = "x-pi-trace-token";
+const ACCESS_QUERY = "access_token";
+const MAX_EVENT_CLIENTS = 8;
 
 interface RegisteredSession {
 	registration: SessionRegistration;
@@ -20,7 +24,8 @@ interface RegisteredSession {
 export interface ViewerController {
 	readonly port: number;
 	readonly url: string;
-	register(registration: SessionRegistration): TraceStore;
+	accessUrl(sessionId?: string): string;
+	register(registration: SessionRegistration, options?: TraceStoreOptions): TraceStore;
 	detach(sessionId: string, snapshot: SessionSnapshot): void;
 	notify(sessionId: string, event: string, payload?: unknown): void;
 	close(): Promise<void>;
@@ -32,11 +37,19 @@ class LocalViewerController implements ViewerController {
 	private server: Server;
 	private sessions = new Map<string, RegisteredSession>();
 	private clients = new Set<ServerResponse>();
+	private accessToken = randomBytes(32).toString("base64url");
 
 	private constructor(server: Server, port: number) {
 		this.server = server;
 		this.port = port;
 		this.url = `http://127.0.0.1:${port}`;
+	}
+
+	accessUrl(sessionId?: string): string {
+		const target = new URL("/", this.url);
+		if (sessionId) target.searchParams.set("session", sessionId);
+		target.hash = new URLSearchParams({ access: this.accessToken }).toString();
+		return target.toString();
 	}
 
 	static async start(startPort: number): Promise<LocalViewerController> {
@@ -45,7 +58,7 @@ class LocalViewerController implements ViewerController {
 				return await new Promise<LocalViewerController>((resolve, reject) => {
 					const server = createServer();
 					const controller = new LocalViewerController(server, port);
-					server.on("request", (request, response) => controller.handle(request.method ?? "GET", request.url ?? "/", response));
+					server.on("request", (request, response) => controller.handleRequest(request, response));
 					const onError = (err: unknown) => {
 						server.close();
 						reject(err);
@@ -68,14 +81,14 @@ class LocalViewerController implements ViewerController {
 		throw new Error(`Could not find an available port from ${startPort} to 65535`);
 	}
 
-	register(registration: SessionRegistration): TraceStore {
+	register(registration: SessionRegistration, options?: TraceStoreOptions): TraceStore {
 		const previous = this.sessions.get(registration.id);
 		if (previous) {
 			previous.registration = registration;
 			this.notify(registration.id, "session-updated");
 			return previous.store;
 		}
-		const store = new TraceStore(registration.snapshot);
+		const store = new TraceStore(registration.snapshot, options);
 		const unlisten = store.onRecord((record) => this.broadcast("trace-record", record));
 		this.sessions.set(registration.id, { registration, store, unlisten });
 		this.notify(registration.id, "session-added");
@@ -113,14 +126,34 @@ class LocalViewerController implements ViewerController {
 		return session.registration.snapshot;
 	}
 
-	private handle(method: string, rawUrl: string, response: ServerResponse): void {
-		const url = new URL(rawUrl, this.url);
+	private handleRequest(request: IncomingMessage, response: ServerResponse): void {
+		try {
+			this.handle(request, response);
+		} catch {
+			this.json(response, 400, { error: "Invalid request" });
+		}
+	}
+
+	private handle(request: IncomingMessage, response: ServerResponse): void {
+		const expectedHost = `127.0.0.1:${this.port}`;
+		if (request.headers.host !== expectedHost) return this.json(response, 403, { error: "Invalid Host" });
+		if (request.headers.origin && request.headers.origin !== this.url) {
+			return this.json(response, 403, { error: "Invalid Origin" });
+		}
+
+		const method = request.method ?? "GET";
+		const url = new URL(request.url ?? "/", this.url);
+		if (url.pathname.startsWith("/api/") && !this.isAuthorized(request, url)) {
+			return this.json(response, 401, { error: "Authentication required" });
+		}
+
 		if (method === "GET" && url.pathname === "/api/events") {
+			if (this.clients.size >= MAX_EVENT_CLIENTS) return this.json(response, 429, { error: "Too many event clients" });
 			response.writeHead(200, {
+				...this.responseSecurityHeaders(),
 				"Content-Type": "text/event-stream",
-				"Cache-Control": "no-cache",
+				"Cache-Control": "no-store",
 				Connection: "keep-alive",
-				"X-Content-Type-Options": "nosniff",
 			});
 			response.write("event: ready\ndata: {}\n\n");
 			this.clients.add(response);
@@ -141,20 +174,22 @@ class LocalViewerController implements ViewerController {
 					tracePersistence: session.store.getPersistence(),
 				};
 			});
-			this.json(response, 200, sessions);
-			return;
+			return this.json(response, 200, sessions);
 		}
 
 		const match = url.pathname.match(/^\/api\/sessions\/([^/]+)(?:\/(calls)(?:\/([^/]+))?|\/(download))?$/);
 		if (method === "GET" && match) {
-			const sessionId = decodeURIComponent(match[1]);
+			const sessionId = safeDecode(match[1]);
+			if (sessionId === undefined) return this.json(response, 400, { error: "Invalid session ID" });
 			const session = this.sessions.get(sessionId);
 			if (!session) return this.json(response, 404, { error: "Session not found" });
 			if (match[4] === "download") {
 				const snapshot = this.snapshot(session);
 				response.writeHead(200, {
+					...this.responseSecurityHeaders(),
 					"Content-Type": "application/x-ndjson; charset=utf-8",
-					"Content-Disposition": `attachment; filename="${sessionId}.jsonl"`,
+					"Content-Disposition": "attachment; filename=\"pi-session-trace.jsonl\"",
+					"Cache-Control": "no-store",
 				});
 				response.end([JSON.stringify(snapshot.header), ...snapshot.entries.map((entry) => JSON.stringify(entry))].join("\n"));
 				return;
@@ -162,7 +197,9 @@ class LocalViewerController implements ViewerController {
 			if (match[2] === "calls") {
 				const calls = session.store.getCalls();
 				if (match[3]) {
-					const call = calls.find((candidate) => candidate.callId === decodeURIComponent(match[3]));
+					const callId = safeDecode(match[3]);
+					if (callId === undefined) return this.json(response, 400, { error: "Invalid call ID" });
+					const call = calls.find((candidate) => candidate.callId === callId);
 					return this.json(response, call ? 200 : 404, call ?? { error: "Call not found" });
 				}
 				return this.json(response, 200, calls);
@@ -178,7 +215,7 @@ class LocalViewerController implements ViewerController {
 		if (method === "GET" && url.pathname === "/vendor/marked.js") return this.file(response, markedPath, "text/javascript");
 		if (method === "GET" && url.pathname === "/vendor/highlight.js") return this.file(response, highlightPath, "text/javascript");
 		if (method === "GET" && url.pathname === "/favicon.ico") {
-			response.writeHead(204, { "Cache-Control": "public, max-age=86400" });
+			response.writeHead(204, { ...this.responseSecurityHeaders(), "Cache-Control": "public, max-age=86400" });
 			response.end();
 			return;
 		}
@@ -189,14 +226,29 @@ class LocalViewerController implements ViewerController {
 		this.json(response, 404, { error: "Not found" });
 	}
 
+	private isAuthorized(request: IncomingMessage, url: URL): boolean {
+		const header = request.headers[ACCESS_HEADER];
+		const token = typeof header === "string" ? header : url.searchParams.get(ACCESS_QUERY) ?? "";
+		return safeEqual(token, this.accessToken);
+	}
+
+	private responseSecurityHeaders(): Record<string, string> {
+		return {
+			"Cross-Origin-Opener-Policy": "same-origin",
+			"Cross-Origin-Resource-Policy": "same-origin",
+			"X-Content-Type-Options": "nosniff",
+			"X-Frame-Options": "DENY",
+		};
+	}
+
 	private file(response: ServerResponse, path: string, contentType: string): void {
 		try {
 			const content = readFileSync(path);
 			response.writeHead(200, {
+				...this.responseSecurityHeaders(),
 				"Content-Type": `${contentType}; charset=utf-8`,
-				"Cache-Control": "no-cache",
-				"Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
-				"X-Content-Type-Options": "nosniff",
+				"Cache-Control": "no-store",
+				"Content-Security-Policy": "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; object-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
 				"Referrer-Policy": "no-referrer",
 			});
 			response.end(content);
@@ -207,9 +259,9 @@ class LocalViewerController implements ViewerController {
 
 	private json(response: ServerResponse, status: number, value: unknown): void {
 		response.writeHead(status, {
+			...this.responseSecurityHeaders(),
 			"Content-Type": "application/json; charset=utf-8",
 			"Cache-Control": "no-store",
-			"X-Content-Type-Options": "nosniff",
 		});
 		response.end(JSON.stringify(value));
 	}
@@ -218,6 +270,20 @@ class LocalViewerController implements ViewerController {
 		const chunk = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 		for (const client of this.clients) client.write(chunk);
 	}
+}
+
+function safeDecode(value: string): string | undefined {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return undefined;
+	}
+}
+
+function safeEqual(left: string, right: string): boolean {
+	const leftBytes = Buffer.from(left);
+	const rightBytes = Buffer.from(right);
+	return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }
 
 const CONTROLLER_KEY = Symbol.for("pi-trace-viewer.controller");

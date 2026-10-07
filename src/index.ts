@@ -15,6 +15,11 @@ export default function piTraceViewer(pi: ExtensionAPI): void {
 		type: "string",
 		default: "7890",
 	});
+	pi.registerFlag("pi-trace-persist", {
+		description: "Persist private trace sidecars under the session cwd (disabled by default)",
+		type: "boolean",
+		default: false,
+	});
 
 	let controller: ViewerController | undefined;
 	let bound: BoundSession | undefined;
@@ -28,13 +33,13 @@ export default function piTraceViewer(pi: ExtensionAPI): void {
 				ctx.ui.notify("Trace viewer is not running. Check the startup error above.", "error");
 				return;
 			}
-			const suffix = bound ? `?session=${encodeURIComponent(bound.id)}` : "";
-			ctx.ui.notify(`${controller.url}/${suffix}`, "info");
+			ctx.ui.notify(controller.accessUrl(bound?.id), "info");
 		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		const port = parsePort(pi.getFlag("pi-trace-port"));
+		const persist = pi.getFlag("pi-trace-persist") === true;
 		try {
 			controller = await getViewerController(port);
 		} catch (error) {
@@ -54,16 +59,16 @@ export default function piTraceViewer(pi: ExtensionAPI): void {
 			file: initial.file,
 			getSnapshot,
 			snapshot: initial,
-		});
+		}, { persist });
 		const collector = new TraceCollector(store, getSnapshot);
 		collector.setTools(latestTools);
 		collector.setSystemPrompt(lastSystemPrompt || ctx.getSystemPrompt());
 		bound = { id: initial.id, collector, getSnapshot };
 		const persistence = store.getPersistence();
-		if (persistence.status === "memory_only") {
-			ctx.ui.notify(`Trace viewer is running in memory only: ${persistence.error ?? "trace directory is unavailable"}`, "warning");
+		if (persist && persistence.status === "memory_only") {
+			ctx.ui.notify(`Trace persistence is unavailable: ${persistence.error ?? "trace directory is unavailable"}`, "warning");
 		}
-		ctx.ui.notify(`Trace viewer: ${controller.url}/?session=${encodeURIComponent(initial.id)}`, "info");
+		ctx.ui.notify(`Trace viewer: ${controller.accessUrl(initial.id)}${persist ? "" : " (memory-only)"}`, "info");
 	});
 
 	pi.on("before_agent_start", (event) => {

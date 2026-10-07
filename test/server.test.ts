@@ -1,7 +1,8 @@
-import { createServer } from "node:http";
+import { createServer, request } from "node:http";
+import type { IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { closeViewerController, getViewerController } from "../src/server.ts";
+import { closeViewerController, getViewerController, type ViewerController } from "../src/server.ts";
 
 async function occupyPort(preferredPort = 0): Promise<{ port: number; close: () => Promise<void> }> {
 	const server = createServer();
@@ -17,7 +18,49 @@ async function occupyPort(preferredPort = 0): Promise<{ port: number; close: () 
 	});
 }
 
-describe("server port selection", () => {
+interface HttpResponse {
+	status: number;
+	headers: IncomingHttpHeaders;
+	body: string;
+}
+
+async function httpRequest(url: string, headers: Record<string, string> = {}): Promise<HttpResponse> {
+	return new Promise((resolve, reject) => {
+		const req = request(url, { headers }, (response) => {
+			const chunks: Buffer[] = [];
+			response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+			response.on("end", () => resolve({
+				status: response.statusCode ?? 0,
+				headers: response.headers,
+				body: Buffer.concat(chunks).toString("utf8"),
+			}));
+		});
+		req.on("error", reject);
+		req.end();
+	});
+}
+
+async function startViewer(): Promise<ViewerController> {
+	const reservation = await occupyPort(0);
+	const port = reservation.port;
+	await reservation.close();
+	return getViewerController(port);
+}
+
+function accessToken(controller: ViewerController): string {
+	const accessUrl = new URL(controller.accessUrl());
+	const token = new URLSearchParams(accessUrl.hash.slice(1)).get("access");
+	expect(accessUrl.pathname).toBe("/");
+	expect(accessUrl.searchParams.has("access_token")).toBe(false);
+	expect(token).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+	return token!;
+}
+
+function authHeaders(controller: ViewerController): Record<string, string> {
+	return { "X-Pi-Trace-Token": accessToken(controller) };
+}
+
+describe("local viewer server", () => {
 	afterEach(async () => {
 		await closeViewerController();
 	});
@@ -44,6 +87,35 @@ describe("server port selection", () => {
 			await second?.close();
 			await first.close();
 		}
+	});
+
+	it("requires authentication for API routes without putting the token in the request URL", async () => {
+		const controller = await startViewer();
+		expect((await httpRequest(`${controller.url}/api/sessions`)).status).toBe(401);
+		expect((await httpRequest(`${controller.url}/`)).status).toBe(200);
+
+		expect((await httpRequest(`${controller.url}/api/sessions`, authHeaders(controller))).status).toBe(200);
+		expect((await httpRequest(`${controller.url}/api/sessions?access_token=${accessToken(controller)}`)).status).toBe(200);
+	});
+
+	it("rejects unexpected Host and Origin headers", async () => {
+		const controller = await startViewer();
+		const headers = authHeaders(controller);
+		expect((await httpRequest(`${controller.url}/api/sessions`, {
+			...headers,
+			Host: `evil.example:${controller.port}`,
+		})).status).toBe(403);
+		expect((await httpRequest(`${controller.url}/api/sessions`, {
+			...headers,
+			Origin: "http://evil.example",
+		})).status).toBe(403);
+	});
+
+	it("returns 400 for malformed URL encoding without stopping the server", async () => {
+		const controller = await startViewer();
+		const headers = authHeaders(controller);
+		expect((await httpRequest(`${controller.url}/api/sessions/%ZZ`, headers)).status).toBe(400);
+		expect((await httpRequest(`${controller.url}/api/sessions`, headers)).status).toBe(200);
 	});
 
 	it("fails when the port range up to 65535 is exhausted", async () => {

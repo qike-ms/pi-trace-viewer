@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { TraceStore } from "../src/store.ts";
 import type { SessionSnapshot } from "../src/types.ts";
@@ -11,6 +11,16 @@ afterEach(() => {
 });
 
 describe("TraceStore", () => {
+	it("keeps traces in memory unless persistence is explicitly enabled", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-trace-memory-"));
+		temporaryDirectories.push(directory);
+		const store = new TraceStore(createSnapshot(directory, join(directory, "session.jsonl")));
+
+		expect(store.filePath).toBeUndefined();
+		expect(store.getPersistence()).toMatchObject({ status: "memory_only" });
+		expect(existsSync(join(directory, ".pi-traces"))).toBe(false);
+	});
+
 	it("persists records with stable sequence numbers and owner-only permissions", () => {
 		const { store } = createStore();
 		store.append({
@@ -28,6 +38,9 @@ describe("TraceStore", () => {
 		expect(store.getRecords().map((record) => record.sequence)).toEqual([1, 2, 3]);
 		expect(statSync(store.filePath!).mode & 0o777).toBe(0o600);
 		expect(readFileSync(store.filePath!, "utf8").trim().split("\n")).toHaveLength(3);
+		const ignorePath = join(dirname(store.filePath!), ".gitignore");
+		expect(readFileSync(ignorePath, "utf8")).toBe("*\n!.gitignore\n");
+		expect(statSync(ignorePath).mode & 0o777).toBe(0o600);
 	});
 
 	it("stores trace sidecars under the session cwd instead of the pi session directory", () => {
@@ -37,9 +50,9 @@ describe("TraceStore", () => {
 		const snapshot = createSnapshot(cwd, join(sessionDirectory, "session.jsonl"));
 		writeFileSync(snapshot.file!, "", "utf8");
 
-		const store = new TraceStore(snapshot);
+		const store = new TraceStore(snapshot, { persist: true });
 
-		expect(store.filePath).toBe(join(cwd, ".pi-traces", "session-1.jsonl"));
+		expect(store.filePath).toBe(join(realpathSync(cwd), ".pi-traces", "session-1.jsonl"));
 		expect(existsSync(join(sessionDirectory, ".pi-traces"))).toBe(false);
 		expect(store.getPersistence()).toMatchObject({ status: "persisted", filePath: store.filePath });
 	});
@@ -51,13 +64,39 @@ describe("TraceStore", () => {
 		const snapshot = createSnapshot(missingCwd, join(sessionDirectory, "session.jsonl"));
 		writeFileSync(snapshot.file!, "", "utf8");
 
-		const store = new TraceStore(snapshot);
+		const store = new TraceStore(snapshot, { persist: true });
 		store.append({ type: "call_started", callId: "call-1", kind: "agent" });
 
 		expect(store.filePath).toBeUndefined();
 		expect(store.getPersistence().status).toBe("memory_only");
 		expect(store.getRecords()).toHaveLength(2);
 		expect(existsSync(join(sessionDirectory, ".pi-traces"))).toBe(false);
+	});
+
+	it("refuses a symlinked trace directory", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-trace-cwd-"));
+		const target = mkdtempSync(join(tmpdir(), "pi-trace-target-"));
+		temporaryDirectories.push(cwd, target);
+		symlinkSync(target, join(cwd, ".pi-traces"));
+
+		const store = new TraceStore(createSnapshot(cwd, join(cwd, "session.jsonl")), { persist: true });
+
+		expect(store.filePath).toBeUndefined();
+		expect(store.getPersistence()).toMatchObject({ status: "memory_only" });
+		expect(existsSync(join(target, "session-1.jsonl"))).toBe(false);
+	});
+
+	it("stops persistence when the configured size limit is reached", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-trace-limit-"));
+		temporaryDirectories.push(directory);
+		const store = new TraceStore(createSnapshot(directory, join(directory, "session.jsonl")), {
+			persist: true,
+			maxBytes: 350,
+		});
+		store.append({ type: "call_failed", callId: "call-1", error: "x".repeat(400) });
+
+		expect(store.filePath).toBeUndefined();
+		expect(store.getPersistence()).toMatchObject({ status: "memory_only" });
 	});
 
 	it("groups event records into a call view", () => {
@@ -101,7 +140,7 @@ describe("TraceStore", () => {
 	it("ignores a truncated final JSONL record during recovery", () => {
 		const { snapshot, store } = createStore();
 		writeFileSync(store.filePath!, `${readFileSync(store.filePath!, "utf8")}{"broken":`, "utf8");
-		const recovered = new TraceStore(snapshot);
+		const recovered = new TraceStore(snapshot, { persist: true });
 		expect(recovered.getRecords()).toHaveLength(1);
 	});
 
@@ -116,7 +155,7 @@ describe("TraceStore", () => {
 			tokensBefore: 12_345,
 			firstKeptEntryId: "kept-entry",
 		}];
-		const recovered = new TraceStore(snapshot);
+		const recovered = new TraceStore(snapshot, { persist: true });
 		const compact = recovered.getCalls().find((call) => call.kind === "compaction");
 		expect(compact).toMatchObject({ status: "success", captureSource: "session_entry", sourceEntryId: "compact-entry" });
 		expect(compact?.providerRequests).toHaveLength(0);
@@ -129,7 +168,7 @@ function createStore(): { snapshot: SessionSnapshot; store: TraceStore } {
 	const sessionFile = join(directory, "session.jsonl");
 	writeFileSync(sessionFile, "", "utf8");
 	const snapshot = createSnapshot(directory, sessionFile);
-	return { snapshot, store: new TraceStore(snapshot) };
+	return { snapshot, store: new TraceStore(snapshot, { persist: true }) };
 }
 
 function createSnapshot(cwd: string, sessionFile: string): SessionSnapshot {

@@ -8,10 +8,12 @@ Pi Trace Viewer answers a practical debugging question: **what did the model act
 
 It runs as a Pi extension and opens a local browser UI where you can inspect the live session tree, model calls, tool activity, compaction inputs, and provider payloads without modifying Pi's native session files.
 
+This hardened fork adds authenticated loopback access, strict Host/Origin validation, memory-only defaults, bounded opt-in persistence, symlink-safe files, and stronger credential-key redaction. It is based on [ZKiteLM/pi-trace-viewer](https://github.com/ZKiteLM/pi-trace-viewer).
+
 ## Install
 
 ```bash
-pi install npm:pi-trace-viewer
+pi install git:github.com/qike-ms/pi-trace-viewer@v0.1.0-hardened.1
 ```
 
 Start a new Pi session and open the viewer:
@@ -20,18 +22,24 @@ Start a new Pi session and open the viewer:
 /trace-view
 ```
 
-The viewer starts at `http://127.0.0.1:7890` by default. If that port is busy, it automatically uses the next available port, such as `7891` or `7892`.
+The viewer starts at `http://127.0.0.1:7890` by default. If that port is busy, it automatically uses the next available port, such as `7891` or `7892`. Pi prints a process-scoped access URL whose random token stays in the URL fragment, is moved into tab-scoped `sessionStorage`, and authenticates API requests. Do not share that URL.
 
 To try the extension for one Pi run without changing your settings:
 
 ```bash
-pi -e npm:pi-trace-viewer
+pi -e git:github.com/qike-ms/pi-trace-viewer@v0.1.0-hardened.1
 ```
 
 To choose a custom starting port:
 
 ```bash
 pi --pi-trace-port 8890
+```
+
+Traces stay in memory by default. Explicitly opt into private sidecars when needed:
+
+```bash
+pi --pi-trace-persist
 ```
 
 ## What You Can Inspect
@@ -93,7 +101,7 @@ flowchart LR
     A[Pi session] --> B[Pi extension hooks]
     B --> C[In-memory viewer state]
     C --> D[localhost browser UI]
-    B --> E[.pi-traces/session-id.jsonl]
+    B -. optional persistence .-> E[.pi-traces/session-id.jsonl]
     D --> F[Session and LLM Calls]
 ```
 
@@ -110,7 +118,7 @@ The extension reads Pi's live snapshot and listens to public lifecycle events, i
 
 ## Data and Privacy
 
-Pi Trace Viewer binds only to `127.0.0.1`.
+Pi Trace Viewer binds only to `127.0.0.1`. Every route requires a random per-process access cookie, and requests with unexpected Host or Origin headers are rejected.
 
 It does not write to Pi's native session JSONL and does not call `appendCustomEntry` or `appendCustomMessageEntry`. Pi's native session remains in:
 
@@ -118,13 +126,13 @@ It does not write to Pi's native session JSONL and does not call `appendCustomEn
 ~/.pi/agent/sessions/<encoded-cwd>/<session-id>.jsonl
 ```
 
-The extension writes sidecar traces to:
+Persistence is disabled by default. With `--pi-trace-persist`, the extension writes sidecar traces to:
 
 ```text
 <session-cwd>/.pi-traces/<session-id>.jsonl
 ```
 
-Trace directories use `0700` permissions and trace files use `0600` permissions. Credential-shaped fields and sensitive response headers are redacted, but prompts, system instructions, tool results, and model output can still contain sensitive data. Treat `.pi-traces` as private local debugging data.
+Trace directories use `0700` permissions, trace files use `0600`, symlinked storage is rejected, a nested `.gitignore` prevents accidental commits, and each trace is capped at 64 MiB. Credential-shaped fields and sensitive response headers are redacted, but prompts, system instructions, tool results, and model output can still contain sensitive data. Treat `.pi-traces` as private local debugging data.
 
 To remove old traces:
 
@@ -135,7 +143,7 @@ rm -rf "/path/to/session-cwd/.pi-traces"
 ## Local Development
 
 ```bash
-npm install
+npm ci --ignore-scripts
 npm run check
 pi -e /path/to/pi-trace-viewer
 ```
